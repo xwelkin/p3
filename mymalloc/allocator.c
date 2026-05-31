@@ -1,11 +1,11 @@
 /**
- * allocator_yuan.c - 袁东霖负责版本
+ * allocator_guo.c - 郭晓伟负责版本（完整版）
  * 
- * 负责内容：
- * 1. 所有宏定义（WSIZE/DSIZE/PACK/GET/PUT/HDRP/FTRP/NEXT_BLKP/PREV_BLKP）
- * 2. my_init() 堆初始化
- * 3. extend_heap() 堆扩展
- * 4. my_check() 堆检查器
+ * 在张仕达版本基础上，添加：
+ * 1. my_free() 内存释放
+ * 2. my_realloc() 内存重分配
+ * 
+ * 这是最终完整版本，包含所有功能
  * 
  * Copyright (c) 2015 MIT License by 6.172 Staff
  */
@@ -72,13 +72,11 @@
 // 静态全局变量
 static char* heap_listp = NULL;
 
-// 函数声明（张仕达负责实现）
+// 函数声明
+static void* extend_heap(size_t words);
 static void* coalesce(void* bp);
 static void* find_fit(size_t asize);
 static void place(void* bp, size_t asize);
-
-// 函数声明（袁东霖负责实现）
-static void* extend_heap(size_t words);
 
 //===================================================================================
 // 袁东霖负责：my_check() - 堆检查器
@@ -86,12 +84,6 @@ static void* extend_heap(size_t words);
 
 /**
  * my_check - 检查堆的完整性
- * 
- * 遍历堆中的所有块，验证：
- * 1. 序言块的头部正确（大小=DSIZE，已分配）
- * 2. 每个块的头部和脚部一致
- * 3. 结尾块的头部正确（大小=0，已分配）
- * 
  * 返回：0表示成功，-1表示失败
  */
 int my_check() {
@@ -110,15 +102,12 @@ int my_check() {
   
   // 遍历所有块
   for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
-    // 检查头部和脚部是否一致
     if (GET_ALLOC(HDRP(bp))) {
-      // 已分配块：脚部的分配位应该也是1
       if (!GET_ALLOC(FTRP(bp))) {
         printf("Allocated block without footer\n");
         return -1;
       }
     } else {
-      // 空闲块：脚本的分配位应该也是0
       if (GET_ALLOC(FTRP(bp))) {
         printf("Free block with allocated footer\n");
         return -1;
@@ -141,18 +130,6 @@ int my_check() {
 
 /**
  * my_init - 初始化内存分配器
- * 
- * 创建初始堆布局：
- * +--------+--------+--------+--------+
- * | 填充(0)| 序言头 | 序言脚 | 结尾头 |
- * | 8字节  | 16|1   | 16|1   | 0|1    |
- * +--------+--------+--------+--------+
- *          ^        ^
- *          |        heap_listp
- *       序言头部
- * 
- * 然后调用extend_heap扩展堆，创建初始空闲块
- * 
  * 返回：0表示成功，-1表示失败
  */
 int my_init() {
@@ -164,7 +141,7 @@ int my_init() {
   PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1));   // 序言头部（16字节，已分配）
   PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1));   // 序言脚部（16字节，已分配）
   PUT(heap_listp + (3*WSIZE), PACK(0, 1));       // 结尾头部（0字节，已分配）
-  heap_listp += (2*WSIZE);  // 指向序言脚部（第一个可分配位置）
+  heap_listp += (2*WSIZE);  // 指向序言脚部
   
   // 扩展空堆（4096字节）
   if (extend_heap(CHUNKSIZE/WSIZE) == NULL)
@@ -179,17 +156,7 @@ int my_init() {
 
 /**
  * extend_heap - 扩展堆
- * 
- * @words: 要扩展的字数（会被调整为偶数以保持对齐）
- * 
- * 工作流程：
- * 1. 调用mem_sbrk分配内存
- * 2. 设置新空闲块的头部和脚部
- * 3. 设置新的结尾头部
- * 4. 调用coalesce合并相邻空闲块（张仕达负责实现）
- * 
- * 关键点：bp = old_brk，这样HDRP(bp)正好覆盖旧的结尾头部
- * 
+ * @words: 要扩展的字数
  * 返回：新空闲块的bp，失败返回NULL
  */
 static void* extend_heap(size_t words) {
@@ -203,8 +170,7 @@ static void* extend_heap(size_t words) {
     return NULL;
   }
   
-  // 关键：bp = old_brk
-  // 这样 HDRP(bp) = old_brk - WSIZE 正好覆盖旧的结尾头部
+  // 关键：bp = old_brk，这样HDRP(bp)正好覆盖旧的结尾头部
   bp = old_brk;
   
   // 初始化空闲块头部/脚部和新的结尾头部
@@ -217,26 +183,219 @@ static void* extend_heap(size_t words) {
 }
 
 //===================================================================================
-// 以下是张仕达和郭晓伟负责实现的函数
-// 张仕达：coalesce, find_fit, place, my_malloc
-// 郭晓伟：my_free, my_realloc
+// 张仕达负责：coalesce() - 空闲块合并
 //===================================================================================
 
-// 占位函数声明（实际实现在其他版本中）
-static void* coalesce_placeholder(void* bp) { return bp; }
-static void* find_fit_placeholder(size_t asize) { return NULL; }
-static void place_placeholder(void* bp, size_t asize) {}
+/**
+ * coalesce - 合并相邻空闲块
+ * @bp: 当前空闲块的指针
+ * 返回：合并后的块指针
+ */
+static void* coalesce(void* bp) {
+  size_t prev_alloc;
+  size_t next_alloc;
+  size_t size = GET_SIZE(HDRP(bp));
+  
+  // 检查前一个块的状态
+  void* prev_bp = PREV_BLKP(bp);
+  size_t prev_size = GET_SIZE(HDRP(prev_bp));
+  if (prev_size == 0) {
+    // 前一个是填充块（padding），视为已分配
+    prev_alloc = 1;
+  } else {
+    prev_alloc = GET_ALLOC(FTRP(prev_bp));
+  }
+  
+  // 检查后一个块的状态
+  next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+  
+  // 情况1：前后都已分配，不合并
+  if (prev_alloc && next_alloc) {
+    return bp;
+  }
+  // 情况2：前已分配，后空闲，与后块合并
+  else if (prev_alloc && !next_alloc) {
+    size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+  }
+  // 情况3：前空闲，后已分配，与前块合并
+  else if (!prev_alloc && next_alloc) {
+    size += GET_SIZE(HDRP(prev_bp));
+    PUT(FTRP(bp), PACK(size, 0));
+    PUT(HDRP(prev_bp), PACK(size, 0));
+    bp = prev_bp;
+  }
+  // 情况4：前后都空闲，与前后都合并
+  else {
+    size += GET_SIZE(HDRP(prev_bp)) + 
+            GET_SIZE(FTRP(NEXT_BLKP(bp)));
+    PUT(HDRP(prev_bp), PACK(size, 0));
+    PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
+    bp = prev_bp;
+  }
+  
+  return bp;
+}
 
+//===================================================================================
+// 张仕达负责：find_fit() - 首次适配搜索
+//===================================================================================
+
+/**
+ * find_fit - 首次适配搜索
+ * @asize: 需要的块大小
+ * 返回：找到的空闲块指针，没找到返回NULL
+ */
+static void* find_fit(size_t asize) {
+  void* bp;
+  
+  // 从堆头开始遍历所有块
+  for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
+    // 找到第一个满足大小要求的空闲块
+    if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
+      return bp;
+    }
+  }
+  
+  return NULL;  // 没找到合适的空闲块
+}
+
+//===================================================================================
+// 张仕达负责：place() - 块分割
+//===================================================================================
+
+/**
+ * place - 在空闲块中放置分配块
+ * @bp: 空闲块指针
+ * @asize: 需要的块大小
+ */
+static void place(void* bp, size_t asize) {
+  size_t csize = GET_SIZE(HDRP(bp));
+  
+  // 如果剩余空间足够大（>=32字节），分割块
+  if ((csize - asize) >= (2*DSIZE)) {
+    // 分配前半部分
+    PUT(HDRP(bp), PACK(asize, 1));
+    PUT(FTRP(bp), PACK(asize, 1));
+    
+    // 创建后半部分空闲块
+    bp = NEXT_BLKP(bp);
+    PUT(HDRP(bp), PACK(csize-asize, 0));
+    PUT(FTRP(bp), PACK(csize-asize, 0));
+  }
+  else {
+    // 剩余空间不足，整个块分配
+    PUT(HDRP(bp), PACK(csize, 1));
+    PUT(FTRP(bp), PACK(csize, 1));
+  }
+}
+
+//===================================================================================
+// 张仕达负责：my_malloc() - 内存分配
+//===================================================================================
+
+/**
+ * my_malloc - 分配内存
+ * @size: 请求的字节数
+ * 返回：分配的内存指针，失败返回NULL
+ */
 void* my_malloc(size_t size) {
-  // TODO: 张仕达实现
-  return NULL;
+  size_t asize;
+  size_t extendsize;
+  char* bp;
+  
+  if (size == 0) return NULL;
+  
+  // 调整块大小以包含头部和脚部，并满足对齐要求
+  asize = MAX(2*DSIZE, ALIGN(size + DSIZE));
+  
+  // 搜索空闲链表
+  if ((bp = find_fit(asize)) != NULL) {
+    place(bp, asize);
+    return bp;
+  }
+  
+  // 没找到合适的空闲块，扩展堆
+  extendsize = MAX(asize, CHUNKSIZE);
+  if ((bp = extend_heap(extendsize/WSIZE)) == NULL)
+    return NULL;
+  
+  place(bp, asize);
+  return bp;
 }
 
+//===================================================================================
+// 郭晓伟负责：my_free() - 内存释放
+//===================================================================================
+
+/**
+ * my_free - 释放内存
+ * 
+ * @ptr: 要释放的内存指针
+ * 
+ * 工作流程：
+ * 1. 获取块大小
+ * 2. 清除头部和脚部的分配位（标记为空闲）
+ * 3. 调用coalesce合并相邻空闲块
+ * 
+ * 为什么释放后要合并？
+ * - 减少外部碎片
+ * - 提高后续分配的成功率
+ */
 void my_free(void* ptr) {
-  // TODO: 郭晓伟实现
+  if (ptr == NULL) return;
+  
+  size_t size = GET_SIZE(HDRP(ptr));
+  
+  // 清除分配位（标记为空闲）
+  PUT(HDRP(ptr), PACK(size, 0));
+  PUT(FTRP(ptr), PACK(size, 0));
+  
+  // 尝试合并相邻空闲块
+  coalesce(ptr);
 }
 
+//===================================================================================
+// 郭晓伟负责：my_realloc() - 内存重分配
+//===================================================================================
+
+/**
+ * my_realloc - 重新分配内存
+ * 
+ * @ptr: 旧内存指针
+ * @size: 新的字节数
+ * 
+ * 工作流程：
+ * 1. 如果ptr为NULL，等同于malloc(size)
+ * 2. 如果size为0，等同于free(ptr)
+ * 3. 分配新大小的内存
+ * 4. 复制旧数据到新内存
+ * 5. 释放旧内存
+ * 
+ * 关键点：
+ * - payload大小 = 块大小 - DSIZE（头部+脚部）
+ * - 只复制min(old_payload_size, new_size)字节
+ * 
+ * 返回：新内存指针，失败返回NULL
+ */
 void* my_realloc(void* ptr, size_t size) {
-  // TODO: 郭晓伟实现
-  return NULL;
+  // 特殊情况处理
+  if (ptr == NULL) return my_malloc(size);
+  if (size == 0) { my_free(ptr); return NULL; }
+  
+  // 分配新块
+  void* newptr = my_malloc(size);
+  if (newptr == NULL) return NULL;
+  
+  // 复制旧数据
+  // 关键：payload大小 = 块大小 - 头部 - 脚部 = 块大小 - DSIZE
+  size_t oldsize = GET_SIZE(HDRP(ptr)) - DSIZE;
+  if (size < oldsize) oldsize = size;
+  memcpy(newptr, ptr, oldsize);
+  
+  // 释放旧块
+  my_free(ptr);
+  
+  return newptr;
 }
